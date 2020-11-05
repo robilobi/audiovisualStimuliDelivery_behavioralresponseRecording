@@ -1,0 +1,844 @@
+from __future__ import division
+
+'''
+GUI module for TMS experiment
+Joseph Thibodeau 2014
+'''
+ 
+import time    
+from BMFP_Config import *
+from Tkinter import *
+from threading import Timer as timr
+from threading import Thread, current_thread
+from threading import enumerate as threadlist
+import pyo as pyo
+from random import randint, shuffle, seed
+from PIL import ImageTk, Image
+from random import randint, shuffle, seed
+#from pynput.mouse import Button, Controller
+from pymouse import PyMouse
+from _pyo import SfPlayer_base
+#from findertools import sleep
+
+
+"""
+BMFP_GUI
+
+Class that we instantiate once to run the application
+"""
+class BMFP_GUI(Frame):              
+
+    """
+    __init__
+    
+    called when the class is instantiated
+    """
+    def __init__(self, master=None, experiment=[], logger=None):
+        
+        ###########################
+        # INIT EXPERIMENT
+        ###########################
+        self.experiment=experiment
+
+        
+        ###########################
+        # INIT LOGGING
+        ###########################
+        self.logger=logger
+        self.currentTrial = 0
+        self.currentBlock = 0
+        self.blockType = 0
+        self.mouse = 0
+        
+        ###########################
+        # INIT TIMING
+        ###########################
+        #self.t = timr(1, self.runexperiment) #placeholder to make sure the variable exists
+        self.timers = []
+        
+        ###########################
+        # INIT VISUAL
+        ###########################
+        self.waitForRatingAnswer = False
+        self.waitForRatingAnswer2 = False
+        self.numRects = 4
+        self.rects=range(self.numRects)
+        self.screenWidth = 640
+        self.screenHeight = 480
+        Frame.__init__(self,master)
+        self.grid()
+        self.userPrompt = StringVar()
+        
+        # moved these up here so they only happen once
+        pianoimage = Image.open(KEYBOARD_IMAGE)
+        self.pianoImage = ImageTk.PhotoImage(pianoimage)
+        sliderimage = Image.open(SLIDER_IMAGE)
+        self.sliderImage = ImageTk.PhotoImage(sliderimage)
+        self.fingerString = StringVar()
+        self.qString = StringVar()
+        self.countString = StringVar()
+
+        self.create_GUI()
+
+        
+        ###########################
+        # INIT AUDI
+        ###########################
+        self.s = pyo.Server(buffersize = 8, nchnls = 1)
+        
+        # before booting the server, I'll prompt the user to choose an input device
+        # NOTE: This can be hard-coded later if you always want it to choose a specific MIDI input device
+#         pyo.pm_list_devices()
+#         self.choice = input("Which device will you choose?")        
+#         self.s.setMidiInputDevice(int(self.choice))
+    
+        self.s.setMidiInputDevice(int(3))
+        
+        self.s.boot()        
+        self.s.start()
+        
+#         test = pyo.LFO(freq=440.0).out()
+        
+        time.sleep(1) # settling time
+        
+#         test.stop()
+        
+        # MIDI Stuff
+        self.refnote = 72
+        self.polynum = 4
+        self.pianosound = range(self.polynum)
+        self.notes = pyo.Notein(poly=self.polynum, scale=0, mul=0.5)
+        self.enablePlayback = False
+        self.enableNoteLogging = False
+        self.noteTrig = pyo.TrigFunc(self.notes['trigon'],self.onNoteon,range(self.polynum))
+        #for p in range(polynum):
+        
+        # note trigger mixer
+        self.trigmix = pyo.Mixer(1,self.polynum)
+        for p in range(self.polynum):
+            self.trigmix.addInput(p,self.notes['trigon'][p])
+            self.trigmix.setAmp(p,0,1.0)
+        self.polyNoteTrig = self.trigmix[0]
+            
+        global midikeymapping # needs to be visible everywhere
+        midikeymapping = 1 # set mapping to 1 to start with
+
+        # preload sound files
+        self.melodies = []
+        self.extract = []
+        
+        for i in range(self.polynum):
+            self.pianosound[i] = pyo.SfPlayer(EXTRACT_DIR + PIANO_FILE[0], speed=1, loop=False, offset=0, interp=2, mul=1, add=0)                
+        for fname in STIM_FILES:
+            self.melodies.append(pyo.SfPlayer(STIM_DIR + fname, mul=0.5))
+        for fname in EXTRACT_FILES:
+            self.extract.append(pyo.SfPlayer(EXTRACT_DIR + fname, mul=0.5))
+        self.metronome = pyo.SfPlayer(EXTRACT_DIR + METRO_FILE[0], mul=0.5)
+        
+        # prepare sequence and timing triggers
+        # metroSeq launches the metronome
+        self.trialMetroSeq = pyo.Seq(time=NOTEDUR/1000.0, seq=[3,3,3,1], poly=1, onlyonce=True, speed=1)
+        self.expectedKeySeq = pyo.Seq(time=NOTEDUR/1000.0, seq=[9,1,1,1,1], poly=1, onlyonce=True, speed=1)
+        # trialStartTrigger will be manually launched when we want to start a trial
+        self.trialStartTrigger = pyo.Trig().stop()
+        self.warmuptrialStartTrigger = pyo.Trig().stop()
+        self.dummyTrigger = pyo.Trig().stop()
+        self.timerLogsEnabled = False
+        # eventTimer will measure the time between trial events
+        # eventTimer is initially triggered by the trial start, but will later be switched to measure between note events
+        self.trialEventTimer = pyo.Timer(self.polyNoteTrig,self.trialStartTrigger)
+        self.expectedEventTimer = pyo.Timer(self.expectedKeySeq,self.expectedKeySeq)
+        self.timerMeasurement = pyo.DataTable(1)
+        self.lastTimerMeasurement = 0.0
+        self.expectedMeasurement = pyo.DataTable(1)
+        self.lastExpectedMeasurement = 0.0
+        self.measurementRecorder = pyo.TablePut(self.trialEventTimer, self.timerMeasurement).play()
+        self.expectedRecorder = pyo.TablePut(self.expectedEventTimer, self.expectedMeasurement).play()
+        self.resetAtStim = False
+
+        
+        # triggers for the optimized stim delivery
+        self.t1 = pyo.TrigFunc(self.trialStartTrigger,self.playAudioExtract)
+        self.t2 = pyo.TrigFunc(self.trialStartTrigger,self.trialMetroSeq.out)
+        self.t2b = pyo.TrigFunc(self.trialStartTrigger,self.expectedKeySeq.out)
+        self.t3 = pyo.TrigFunc(self.trialMetroSeq,self.playMetronome)
+#         self.t3 = pyo.TrigFunc(self.trialMetroSeq,self.metronome.out)
+        self.t4 = pyo.TrigFunc(self.polyNoteTrig,self.noteTiming)
+        self.t5 = pyo.TrigFunc(self.expectedKeySeq,self.expectedTiming)
+
+        # triggers for the optimized stim delivery in training
+        #self.t1 = pyo.TrigFunc(self.warmuptrialStartTrigger,self.playAudioExtract)
+        self.t6 = pyo.TrigFunc(self.warmuptrialStartTrigger,self.trialMetroSeq.out)
+        self.t7 = pyo.TrigFunc(self.warmuptrialStartTrigger,self.expectedKeySeq.out)
+#         self.t3 = pyo.TrigFunc(self.trialMetroSeq,self.playMetronome)
+#         self.t3 = pyo.TrigFunc(self.trialMetroSeq,self.metronome.out)
+#         self.t4 = pyo.TrigFunc(self.notes['trigon'],self.noteTiming)
+#         self.t5 = pyo.TrigFunc(self.expectedKeySeq,self.expectedTiming)
+
+        
+        ###########################
+        # INIT INPUT DEVICES
+        ###########################
+        self.set_keybinds()
+        self.waitForSpacebar = True
+
+        ############################
+        self.enableAudioFeedback = False
+        self.QUIT = False
+        self.pause = False
+       
+       
+    """
+    our own timing function
+    """
+    def after2(self,time,fun,arg=None):
+        if arg == None:
+            t = timr(time/1000.0,fun) #prepare a time delay before moving on to the next instruction
+        else:
+            t = timr(time/1000.0,fun,[arg]) #prepare a time delay before moving on to the next instruction
+        self.timers.append(t)
+        t.start() #launch the timer
+          
+    """
+    onNoteon function
+    
+    This runs every time a midi is received
+    """
+    def onNoteon(self, voice):
+        global midikeymapping #needs to be visible everywhere
+        
+        midinote = self.notes.get("pitch",True)[voice]
+        
+        print 'note ' + str(midinote)
+        #here is where you change the incoming notes using a custom mapping
+    
+        if midinote in INPUT_TARGETS:
+            midiidx = INPUT_TARGETS.index(midinote)               
+            midinote = INPUT_MAPS[midikeymapping][midiidx]
+            
+            if self.enablePlayback == True:
+                print str(voice) + " note received: " + str(midinote) + " with velocity " + str(self.notes.get("velocity",True)[voice])            
+                ratio =2**((midinote - self.refnote)/12.0)
+                self.pianosound[voice].setSpeed(ratio)
+                self.pianosound[voice].out()
+            if self.enableNoteLogging == True:  
+                self.logger.write('KEYPRESS' + DELIM + str(midiidx+1) +  DELIM + str(self.notes.get("velocity",True)[voice])) #log the response
+    
+    def doEnablePlayback(self):
+        self.enablePlayback = True
+    def doDisablePlayback(self):
+        self.enablePlayback = False
+        
+    def doResetAtStim(self):
+        self.resetAtStim = True
+        
+    """
+    Note timing measurement function
+    
+    This logs the time between note events
+    """
+    def noteTiming(self):
+        thisMeasure = self.timerMeasurement.getTable()[0] # first element (only element)
+        if thisMeasure != self.lastTimerMeasurement: # only act on this measure if it's different!
+            self.lastTimerMeasurement = thisMeasure
+    
+            thisAccum = thisMeasure + self.timerAccumulation # accumulate timing
+            self.timerAccumulation = thisAccum
+            
+            self.measurementRecorder.play() # re-enable the table to receive data
+            if (thisAccum != 0) and (self.timerLogsEnabled == True): # filter out zeros
+                self.logger.write('KEY_ONSET' + DELIM + str(thisAccum))
+    #             print "timing: " + str(tmp) #DEBUG
+            else: #log something in case we rejected or are not using this onset
+                self.logger.write('POSSIBLE_KEY_ONSET_MEASURE' + DELIM + str(thisMeasure))
+            
+    def expectedTiming(self):
+        self.logger.write('TIMER' + DELIM + str(self.expectedMeasurement.getTable()[0]))
+        if (self.resetAtStim):
+            self.resetAtStim = False
+            #self.logger.write('RESET_TIMING' + DELIM + str(self.expectedMeasurement.getTable()[0]))
+            self.resetTimingMeasures()
+            self.expectedRecorder.play()
+        else:
+            thisAccum = self.expectedMeasurement.getTable()[0] + self.expectedAccumulation # first element (only element)
+            self.expectedAccumulation = thisAccum
+            self.expectedRecorder.play() # re-enable the table to receive data
+            if (thisAccum != 0) and (self.timerLogsEnabled == True): # filter out zeros
+                self.logger.write('EXPECTED_ONSET' + DELIM + str(thisAccum))
+    #             print "timing: " + str(tmp) #DEBUG
+
+    def resetTimingMeasures(self):
+        self.timerAccumulation = 0.0
+        self.lastTimerMeasurement = 0.0
+        self.expectedAccumulation = 0.0
+        self.timerMeasurement.put(0,0)
+        self.expectedMeasurement.put(0,0)
+    
+    """
+    create_GUI function
+    
+    This builds the GUI using Tkinter. Tkinter is a bit old-fashioned but it works.
+    """
+    def create_GUI(self):
+        
+        # basic window size information
+        #self.width = 800 
+        #self.height = 600 
+        self.width = self.master.winfo_screenwidth() # / 2
+        self.height = self.master.winfo_screenheight() # / 2
+        self.borderSize = self.width/20
+        self.master.attributes("-fullscreen", True)
+        
+        # create master configuration
+        #self.master.geometry("{0}x{1}+0+0".format(self.width, self.height))
+        self.master.grid_columnconfigure(0, minsize = self.width)
+        self.master.grid_rowconfigure(0, minsize = self.height)
+        self.master.protocol('WM_DELETE_WINDOW', self.quitexperiment)  # stops the experiment if you press the [x] button       
+         
+        #change the cursor position with .move method
+        self.mousepos = PyMouse()
+        
+        # make the canvas that sits on the master
+        self.canvas = Canvas(self, width=self.width, height=self.height)
+        self.canvas.grid()
+        
+        # for drawing rects
+#         self.rectCanvas = Canvas(self.canvas, width = self.width, height=self.height)
+#         self.squareWH = (self.width/self.numRects) - 2*(self.borderSize)
+        
+        # for displaying piano
+        self.panel = Canvas(self.canvas, width = self.width, height=self.height)
+        self.pianoLabel = Label(self.panel, image=self.pianoImage)
+        self.pianoLabel.img = self.pianoImage
+        self.pianoLabel.grid()
+        self.fingerLabel = Label(self.panel, textvariable=self.fingerString, font=("Courier",48))
+        self.fingerLabel.config(background="white")
+        self.fingerString.set(" ")
+        self.fingerLabel.grid(row=2,column=1)
+        self.countLabel = Label(self.panel, textvariable=self.countString, font=("Helvetica",24), bg= ("red"))
+        self.countString.set(" ")
+        self.countLabel.grid(row=0,column=0)
+        # for displaying slider
+        self.slid = Canvas(self.canvas, width = self.width, height=self.height)
+        self.sliderLabel = Label(self.slid, image=self.sliderImage)
+        self.sliderLabel.img = self.sliderImage
+        self.sliderLabel.grid()
+        self.qLabel = Label(self.slid, textvariable=self.qString, font=("Helvetica",20))
+        self.qString.set(" ")
+        self.qLabel.grid(row=0,column=2)
+        
+        # make the user display prompt
+        # self.displayText = Label(self.canvas, width=100, font=("Helvetica", 18), textvariable=self.userPrompt, wraplength=self.width*2/3)
+        self.displayText = Label(self.canvas, font=("Helvetica", 16), textvariable=self.userPrompt, wraplength=self.width*2/3)
+        self.displayText.grid(row=4, column=4, rowspan=3,columnspan=self.numRects)
+        
+        # make rating radio buttons
+        self.ratingResponse = IntVar(self.master,0)
+        self.responseRadio = [0,1,2,3,4]
+        self.responseText = ['  1  ', '  2  ', '  3  ', '  4  ' , '  5  ']
+        for r in range(0,5):
+            self.responseRadio[r] = Radiobutton(self.canvas, text=str(self.responseText[r]), font=("Helvetica", 24), variable = self.ratingResponse, value=[r], indicatoron=0, padx=10,pady=10) #delete command="", if want to use mouse response
+            self.responseRadio[r].grid(row=1, column=2, columnspan = 1)
+            
+        # disable recog answers:
+        self.disableResponse()
+        self.userPrompt.set(OPENING_PROMPT)
+        # disable opening text and radio buttons at first, which for some reason is necessary before we draw the rectangles
+        self.displayText.grid_forget()
+        for r in range(0,5):
+            self.responseRadio[r].grid_forget()
+        # re-enable the display text
+        self.enableDisplayText()
+        # draw the rectangles
+#         for i in range(self.numRects):
+#             self.rectX = i*(self.width / self.numRects) + self.borderSize
+#             self.rectY = (self.height / 2) - (self.squareWH / 2)
+#             self.rects[i] = self.rectCanvas.create_rectangle(self.rectX,self.rectY,self.rectX+self.squareWH,self.rectY+self.squareWH)
+#             self.rectCanvas.itemconfigure(self.rects[i],fill='light grey',outline='light grey')
+# #             self.rectCanvas.itemconfigure(self.rects[i],state=HIDDEN)
+#         self.rectCanvas.grid(row=1,column=1, rowspan=7,columnspan=7)
+#         self.rectCanvas.grid_forget()
+     
+    """
+    drawRects and eraseRects function
+    
+    're-draw' the rectangles by putting them back into the GUI
+    or
+    'erase' them by removing them from the GUI
+    """
+    def drawRects(self):
+        self.rectCanvas.grid(row=1,column=1, rowspan=7,columnspan=7)
+        for i in range(self.numRects):
+            self.rectCanvas.itemconfigure(self.rects[i],state=NORMAL)
+ 
+    def eraseRects(self):
+        self.rectCanvas.grid_forget()
+        
+    """
+    enableDisplayText and disableDisplayText function
+    
+    re-enables or disables the displaytext by putting it or removing it to/from the GUI
+    """
+    def enableDisplayText(self):
+        self.displayText.grid(row=1, column=1, rowspan=7,columnspan=7)
+        
+    def disableDisplayText(self):
+        self.displayText.grid_forget()
+
+    """
+    enable or disable log timers
+    
+    This is just to get around annoying Timer functionality
+    """
+    def enableTimerLogs(self):
+        self.timerLogsEnabled = True
+    def disableTimerLogs(self):
+        x =5
+        #self.timerLogsEnabled = False
+
+
+    """
+    enableResponse and disableResponse function
+    
+    enables/disables the response buttons by removing/replacing them in the GUI
+    """
+    def enableResponse(self):
+        for r in range(0,5):
+            self.responseRadio[r].grid(row=6, column=[r], columnspan = 1) #TODO: put these values in config file
+            self.responseRadio[r].config(state=NORMAL)
+            self.responseRadio[r].deselect()
+
+            
+    def disableResponse(self):
+        self.userPrompt.set(BLANK_TEXT)
+        for r in range(0,5):
+            self.responseRadio[r].deselect()
+            self.responseRadio[r].config(state=DISABLED)
+            self.responseRadio[r].grid_forget()
+
+    """
+    answerRating function
+    
+    This is called when the subject rates the melody 
+    """
+    def answerRating(self):
+        if self.waitForRatingAnswer: #only works if we're waiting for an answer
+            
+            #make the cursor disappear
+            self.after2(500,self.eraseSlider)
+            self.waitForRatingAnswer = False #we are no longer waiting for an answer
+            #answer = self.ratingResponse.get() #get the rating value
+            answer = ((self.mouse/800)*100)    #((space between each point/total space)* N of choice) + 1
+            time.sleep(0.5) #sleep for half a second
+            #self.disableResponse() #disable the response buttons
+            self.logger.write('Answer_'+str(answer)) #log the response
+            self.after2(600, self.drawSlider2)
+            self.waitForRatingAnswer2 =True
+            
+        elif self.waitForRatingAnswer2:
+            self.after2(500,self.eraseSlider)
+            self.waitForRatingAnswer2 = False #we are no longer waiting for an answer
+            #answer = self.ratingResponse.get() #get the rating value
+            answer = ((self.mouse/800)*100)    #((space between each point/total space)* N of choice) + 1
+            time.sleep(0.5) #sleep for half a second
+            #self.disableResponse() #disable the response buttons
+            self.logger.write('Answer2_'+str(answer)) #log the response
+            self.t = timr(1,self.runexperiment) #prepare a time delay before moving on to the next instruction
+            self.t.start() #launch the timer
+    
+
+    def enableWaitForAnswer(self):
+        self.waitForRatingAnswer = True
+
+    """
+    set_keybinds function
+    
+    sets all keys to trigger the keyPress function
+    """
+    def set_keybinds(self):
+        self.master.bind('<Key>', self.keyPress)
+        self.master.bind("<Button-1>", self.mouseclick)
+        self.master.bind("<Escape>", self.doQuitButton)
+        
+    def doQuitButton(self,event):
+        self.quitexperiment()
+
+    """
+    keyPress function
+    
+    Handle key presses
+    """
+    def keyPress(self, event):
+        pressed = event.char
+        if self.waitForSpacebar == True and pressed == SPACEBAR:
+            self.waitForSpacebar = False
+            self.userPrompt.set(BLANK_TEXT)
+            self.t = timr(1,self.runexperiment) #TODO: hardcoded!
+            self.t.start()
+        if self.waitForRatingAnswer == True and pressed in responseButts:
+            self.responseRadio[pressed].invoke()
+        if pressed == PAUSE_BUTTON:
+            self.pause = not self.pause
+            
+    def mouseclick(self,event):
+        print "mouse click at " + str(event.x) + ", " + str(event.y)
+        self.mouse = event.x
+        self.answerRating()
+        
+    """
+    playAudioStim
+    
+    plays a soundfile
+    """
+    def playAudioStim(self,stimID):
+        # Expects an integer no larger than the total number of audio stims
+        self.melodies[stimID].out()
+        self.logger.write("Stim" + DELIM + str(stimID))
+    
+    def playAudioExtract(self):
+        # Expects an integer no larger than the total number of audio stims
+        stimID = self.currentTrial
+        self.extract[stimID].out()
+        self.logger.write("Extract" + DELIM + str(stimID))
+        # now that we have started playing the extract, set the trigger
+        # to measure time between MIDI notes
+#         self.trialEventTimer.setInput2(self.notes['trigon'])
+        #self.playMetronome()
+        #self.after2(NOTEDUR*3,self.playMetronome)
+        #self.after2(NOTEDUR*3*2,self.playMetronome)
+        #self.after2(NOTEDUR*3*3,self.playMetronome)
+    
+    def playMetronome(self):
+        # Expects an integer no larger than the total number of audio stims
+        self.metronome.out()
+#         self.logger.write("Metronome")
+        
+    def playExtractTrial(self):
+        # this uses new, more accurate timing controls
+        # get ready to measure distance between events
+#         self.trialEventTimer.stop()
+#         self.expectedEventTimer.stop()
+#         self.trialEventTimer.setInput2(self.trialStartTrigger)
+        # now that everything is set up, launch the trial!
+#         self.trialEventTimer.play()
+#         self.expectedEventTimer.play()
+        self.trialStartTrigger.play()
+        self.after2(100,self.trialEventTimer.setInput,self.polyNoteTrig)
+        self.after2(100,self.trialEventTimer.setInput2,self.polyNoteTrig)
+        self.after2(100,self.measurementRecorder.play)
+        self.after2(100,self.expectedRecorder.play)
+
+    def noplayExtractTrial(self):
+        # this uses new, more accurate timing controls
+        # get ready to measure distance between events
+#         self.trialEventTimer.stop()
+#         self.expectedEventTimer.stop()
+#         self.trialEventTimer.setInput2(self.trialStartTrigger)
+        # now that everything is set up, launch the trial!
+#         self.trialEventTimer.play()
+#         self.expectedEventTimer.play()
+        self.warmuptrialStartTrigger.play()
+        self.after2(100,self.trialEventTimer.setInput,self.polyNoteTrig)
+        self.after2(100,self.trialEventTimer.setInput2,self.polyNoteTrig)
+        self.after2(100,self.measurementRecorder.play)
+        self.after2(100,self.expectedRecorder.play)
+    
+    """
+    Draw/erase piano image
+    
+    """
+    def drawPiano(self):
+        self.panel.grid()
+        self.pianoLabel.img = self.pianoImage
+        self.pianoLabel.grid(row=1,column=1,rowspan=2,columnspan=4)
+    
+    def erasePiano(self):
+        self.panel.grid_forget()
+
+    
+        """
+    Draw/erase sliderimage
+    
+    """
+    def drawSlider(self):
+        self.slid.grid()
+        self.sliderLabel.img = self.sliderImage
+        self.sliderLabel.grid(row=1,column=1,rowspan=2,columnspan=4) 
+        
+        self.qString.set(" ")
+        self.qLabel = Label(self.panel, textvariable=self.qString, font=("Helvetica",20))
+        self.qLabel.config(background="white")
+        self.qLabel.grid(row=0,column=0)  ###it is defined up
+        self.qString.set("How much did you enjoy to play this melody?")
+        self.mousepos.move(720,50)
+        self.logger.write('SliderONSET')
+        
+    def eraseSlider(self):
+        self.slid.grid_forget()
+        self.qLabel.grid_forget()
+    
+    def drawSlider2(self):
+        self.slid.grid()
+        self.sliderLabel.img = self.sliderImage
+        self.sliderLabel.grid(row=1,column=1,rowspan=2,columnspan=4) 
+        
+        self.qString.set(" ")
+        self.qLabel = Label(self.panel, textvariable=self.qString, font=("Helvetica",20))
+        self.qLabel.config(background="white")
+        self.qLabel.grid(row=0,column=0)  ###it is defined up
+        self.qString.set("How much predictable was this melody?")
+        self.mousepos.move(720,50)
+        self.logger.write('SliderONSET')
+        
+    def eraseSlide2(self):
+        self.slid.grid_forget()
+        self.qLabel.grid_forget()
+
+    """
+    Make a visual stim
+    """ 
+    def visualstim(self, stimID=0): 
+        global midikeymapping
+        
+        if self.blockType == WARMUP_BLOCK:
+            thisFinger = warmupINPUT_FINGERS[self.currentTrial][stimID]
+        else:
+            thisFinger = INPUT_FINGERS[midikeymapping][stimID]
+         
+        # erase the old finger label
+#         if stimID == 0:
+#             self.after2(1,self.fingerLabel.grid_forget)
+        
+        # make a new finger label and put it on the grid
+#         self.fingerString.set(" ")
+#         self.fingerLabel = Label(self.panel, textvariable=self.fingerString, font=("Helvetica",24))
+        self.fingerLabel.grid(row=2,column=thisFinger)
+        self.fingerString.set(" ")
+#         self.fingerLabel.config(background="blue")
+#         self.fingerLabel.config(fg="blue")
+        self.after2(1,self.colourBox)
+        
+        if self.blockType == WARMUP_BLOCK:
+            self.logger.write("EXPECTED_KEY" + DELIM + str(stimID) + DELIM + str(warmupINPUT_FINGERS[self.currentTrial][stimID]))  # OKish: 3 ms progressive delay
+        else:
+            self.logger.write("EXPECTED_KEY" + DELIM + str(stimID) + DELIM + str(INPUT_FINGERS[midikeymapping][stimID]))  # OKish: 3 ms progressive delay
+        # increment the stimID and either keep stimming or finiFsh the trial
+        nextID = stimID + 1
+        if nextID >= NOTE_SET_LENGTH: #no more stims
+            self.after2(500,self.fingerLabel.grid_forget)
+            self.after2(500,self.erasePiano)
+            #self.after(1000,self.runexperiment)
+        else: # more stims, call myself after 1000ms
+            self.after2(NOTEDUR,self.visualstim,nextID)  ##for 140bpm wav
+            #self.after2(NOTEDUR,self.playMetronome)
+            self.after2(200,self.fingerLabel.grid_forget)  #erase finger label a bit before the next appears
+            
+    def colourBox(self):
+        self.fingerLabel.config(background="cyan")
+        self.fingerLabel.config(fg="cyan")
+            
+    """
+    count repetitions
+    """    
+    def countRep(self, num):
+        self.countString.set(" ")
+        self.countLabel = Label(self.panel, textvariable=self.countString, font=("Helvetica",20))
+        self.countLabel.config(background="white")
+        self.countLabel.grid(row=0,column=0)  ###it is defined up
+        self.countString.set(num)
+        
+    def eraseCounter(self):
+        self.countString.set("")
+        self.countLabel.grid_forget()
+
+    
+    """
+    logResponse
+    
+    logs a response
+    """
+    def logResponse(self, target): #TODO: modify with new piano keys as log targets
+        #target is an int representing the key corresponding to a square 1..4
+        self.logger.write("RESPONSE" + DELIM + str(target))
+        
+
+    """    
+    quitexperiment
+    
+    stop things that need stopping and then destroy itsself
+    """
+    def quitexperiment(self):
+        print "quitting experiment..." #TODO: DEBUG
+        self.s.stop()
+        for t in self.timers:
+            if t.is_alive:
+                t.cancel()
+        this_thread = current_thread()
+        for t in threadlist():
+            if t.is_alive() and t != this_thread:
+                t.join(0.1)
+        self.after(1000,self.master.destroy) #kill the GUI
+        return
+    
+    
+    """
+    runexperiment
+    
+    process the next instruction in the list
+    """
+    def runexperiment(self):
+        global midikeymapping # needs to be visible everywhere
+        if self.experiment: # if there are instructions left
+            
+            if self.pause:
+                while self.pause:
+                    time.sleep(1)
+            
+            # if waiting for spacebar, stall here
+            while self.waitForSpacebar:
+                if self.QUIT == True:
+                    self.quitexperiment()
+                    return
+            
+            instruction = self.experiment.pop() # get the next instruction
+            print instruction
+            print 'block type: ' + str(self.blockType)
+                        #.....................
+            #....BLOCK START......
+            #.....................
+            if instruction[0] == BLOCK_START_INST:
+                self.blockType = instruction[2]
+                
+                if self.blockType == RATING_BLOCK:
+                    self.userPrompt.set(RATING_PROMPT)
+                    self.logger.write("RatingBlockStart" + DELIM + str(self.currentBlock))
+                    self.waitForSpacebar = True
+                                
+                elif self.blockType == WARMUP_BLOCK:
+                    self.userPrompt.set(WARMUP_PROMPT)
+                    self.logger.write("WarmupBlockStart" + DELIM+ str(self.currentBlock))
+                    self.waitForSpacebar = True
+                    self.trialEventTimer._started = 0 #not sure if this actually affects anything
+                    self.trialEventTimer.setInput(self.warmuptrialStartTrigger)
+                    self.trialEventTimer.setInput2(self.warmuptrialStartTrigger)
+                    
+                elif self.blockType == PLAYBACK_BLOCK:
+                    self.userPrompt.set(PLAYBACK_PROMPT)
+                    self.logger.write("PlaybackBlockStart" + DELIM+ str(self.currentBlock))
+                    self.waitForSpacebar = True
+                    self.trialEventTimer._started = 0 #not sure if this actually affects anything
+                    self.trialEventTimer.setInput(self.trialStartTrigger)
+                    self.trialEventTimer.setInput2(self.trialStartTrigger)
+                    
+                elif self.blockType == PERFORM_BLOCK:
+                    self.userPrompt.set(PERFORM_PROMPT)
+                    self.logger.write("PerformBlockStart" + DELIM + str(self.currentBlock))
+                    self.waitForSpacebar = True
+                    self.trialEventTimer._started = 0 #not sure if this actually affects anything
+                    self.trialEventTimer.setInput(self.trialStartTrigger)
+                    self.trialEventTimer.setInput2(self.trialStartTrigger)
+
+            #.....................
+            #...BLOCK FINISH......
+            #.....................                            
+            elif instruction[0] == BLOCK_FINISH_INST:
+                self.userPrompt.set(BLOCK_COMPLETION_PROMPT)
+                self.logger.write("BlockFinish" + DELIM + str(self.currentBlock))
+                self.waitForSpacebar = True
+                
+            #.....................
+            #....TRIAL START......
+            #.....................   
+                                     
+            elif instruction[0] == TRIAL_START_INST:
+                self.logger.write("TrialStart" + DELIM + str(instruction[1]) + DELIM + str(instruction[2]) + DELIM + str(INPUT_COND[instruction[1]]))
+                self.currentTrial = instruction[1]
+                self.mousepos.move(0,50)
+                # removing rectangles for now
+#                 self.drawRects()
+                # TRIAL CODE GOES HERE:
+                if self.blockType == RATING_BLOCK:
+                    self.enablePlayback = False
+                    self.playAudioStim((instruction[1])) # play an audio stimulus
+                    self.userPrompt.set("+")
+                    self.after2(1000, self.userPrompt.set,"")
+                    self.after2(1000,self.drawPiano)
+                    #self.after(1000,self.enableResponse)
+                    self.waitForRatingAnswer = True
+                    self.after2(2000, self.erasePiano)
+                    
+                elif self.blockType == WARMUP_BLOCK:
+                    self.after2(100,self.resetTimingMeasures)
+                    #self.playAudioExtract() # play an audio stimulus
+                    self.enablePlayback = False
+                    self.enableNoteLogging = True
+                    #midikeymapping = self.currentTrial # 0 to 7
+                    self.after2(1,self.drawPiano)
+                    self.after2(2,self.countRep, instruction[2])
+                    self.after2(NOTEDUR,self.enableTimerLogs)
+                    self.after2(NOTEDUR*9,self.visualstim)     #428*9notes
+                    self.after(NOTEDUR*15,self.runexperiment)   #428*15notes
+                    self.noplayExtractTrial()
+                
+                elif self.blockType == PLAYBACK_BLOCK:
+                    self.after2(100,self.resetTimingMeasures)
+                    #self.playAudioExtract() # play an audio stimulus
+                    self.enablePlayback = True
+                    self.enableNoteLogging = True
+                    midikeymapping = self.currentTrial # 0 to 7
+                    self.after2(1,self.drawPiano)
+                    self.after2(2,self.countRep, instruction[2])
+                    self.after2(NOTEDUR,self.enableTimerLogs)
+                    self.after2(NOTEDUR*9,self.visualstim)     #428*9notes
+                    self.after(NOTEDUR*15,self.runexperiment)   #428*15notes
+                    self.playExtractTrial()
+                    
+                elif self.blockType == PERFORM_BLOCK:
+                    self.enablePlayback = False
+                    self.enableNoteLogging = True
+                    self.disableTimerLogs()
+                    self.playAudioStim(instruction[1])
+                    self.userPrompt.set("+")
+                    midikeymapping = self.currentTrial # 0 to 7
+                    self.after2(1,self.eraseCounter)
+                    self.after2(NOTEDUR*14, self.userPrompt.set,"") 
+                    self.after2(NOTEDUR*14, self.doEnablePlayback)
+#                     self.after2(NOTEDUR*15, self.playAudioExtract) # play an audio stimulus after 6420 ms
+                    self.after2(NOTEDUR*14,self.doResetAtStim)
+                    self.after2(NOTEDUR*15,self.playExtractTrial) # play an audio stimulus after 6420 ms
+                    self.after2(NOTEDUR*15,self.drawPiano)  # draw piano after 6420 ms 
+                    self.after2(NOTEDUR*16,self.enableTimerLogs)
+                    self.after2(NOTEDUR*24,self.visualstim)       # after extract is played, 3852ms, display fingers
+                    self.after2(NOTEDUR*30,self.disableTimerLogs)
+                    self.after2(NOTEDUR*30,self.doDisablePlayback)
+                    self.after2(NOTEDUR*30,self.drawSlider)
+                    self.after2(NOTEDUR*30,self.enableWaitForAnswer)    
+
+
+            #.....................
+            #...TRIAL FINISH......
+            #.....................                         
+            elif instruction[0] == TRIAL_FINISH_INST:
+                
+                self.t = timr(1,self.runexperiment)
+                self.t.start()
+                self.logger.write("TrialFinish" + DELIM + str(instruction[1])) #TODO: put these messages in config
+                
+                if self.blockType == WARMUP_BLOCK:
+                    self.trialEventTimer._started = 0 #not sure if this actually affects anything
+                    self.trialEventTimer.setInput(self.warmuptrialStartTrigger)
+                    self.trialEventTimer.setInput2(self.warmuptrialStartTrigger)
+                elif (self.blockType == PERFORM_BLOCK) or (self.blockType == PLAYBACK_BLOCK):
+                    self.trialEventTimer._started = 0 #not sure if this actually affects anything
+                    self.trialEventTimer.setInput(self.trialStartTrigger)
+                    self.trialEventTimer.setInput2(self.trialStartTrigger)
+                
+                self.disableTimerLogs()
+                self.doResetAtStim()
+#                 self.trialEventTimer.setInput(self.dummyTrigger)
+#                 self.after2(100,self.dummyTrigger.play)
+                # self.eraseRects()
+
+        else: # no more instructions
+            self.userPrompt.set("END")
+            print "Experiment complete"
